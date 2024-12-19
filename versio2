@@ -1,0 +1,138 @@
+import pandas as pd
+import json
+import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+
+# Load environment variables
+load_dotenv()
+
+# Initialize LLM with OpenAI
+llm = ChatOpenAI(temperature=0, model="gpt-4")
+
+# Step 1: Load CSV file and generate the schema
+def load_csv(file_path):
+    """Load CSV file into a DataFrame."""
+    df = pd.read_csv(file_path)
+    return df
+
+def generate_basic_schema(df):
+    """Generate a basic schema with column details."""
+    schema = []
+    for column in df.columns:
+        col_data = df[column]
+        col_info = {
+            "Column Name": column,
+            "Data Type": str(col_data.dtype),
+            "Max Value": col_data.max() if col_data.dtype in ['int64', 'float64'] else None,
+            "Min Value": col_data.min() if col_data.dtype in ['int64', 'float64'] else None,
+            "Distinct Values": col_data.unique().tolist() if col_data.nunique() < 10 else "Too many to display",
+            "Definition": "Definition not provided"  # Placeholder for variable definition
+        }
+        schema.append(col_info)
+    return schema
+
+# Step 2: Convert DataFrame to SQL database
+def setup_database(df):
+    """Create an in-memory SQLite database from the DataFrame."""
+    engine = create_engine("sqlite:///:memory:")
+    df.to_sql("data_table", con=engine, index=False, if_exists="replace")
+    return engine
+
+# Step 3: Enhance schema using LLM with PromptTemplate and LLMChain
+def enhance_schema_with_llm(llm, schema):
+    """Use LLM to enhance schema with detailed information."""
+    schema_json = json.dumps(schema, indent=2)
+    prompt_template = PromptTemplate(
+        template="Here is a schema for a CSV file with basic details about each column:\n\n{schema_json}\n\n"
+                 "For each column, please enhance the schema with:\n"
+                 "1. A clear description of what the column represents.\n"
+                 "2. Typical values and what they mean.\n"
+                 "3. Any known relationships or dependencies with other columns.\n"
+                 "4. Any potential use cases or relevant business insights for each variable.\n\n"
+                 "Return the enhanced schema in a structured format.",
+        input_variables=["schema_json"]
+    )
+    
+    chain = prompt_template | llm
+    response = chain.invoke({"schema_json": schema_json})  # Get the LLM response
+
+    # Print the response for debugging
+    print("DEBUG: Response from LLM:")
+    print(response)
+
+    # Try to parse response as JSON
+    try:
+        enhanced_schema = json.loads(str(response))
+        return enhanced_schema
+    except json.JSONDecodeError:
+        print("DEBUG: Failed to parse response as JSON.")
+        return None  # Handle this gracefully in the main function
+
+
+# Step 4: Process user questions in natural language and generate SQL
+def ask_question_and_query(sql_engine, question, enhanced_schema):
+    """Convert natural language question to SQL and query the database."""
+    schema_info = json.dumps(enhanced_schema, indent=2)
+    prompt_template = PromptTemplate(
+        template="Here is the enhanced schema for the data:\n\n{schema_info}\n\n"
+                 "Given the following question: \"{question}\"\n"
+                 "Generate an SQL query that can answer the question.\n"
+                 "Respond with only the SQL query.",
+        input_variables=["schema_info", "question"]
+    )
+    
+    chain = prompt_template | llm
+    sql_query = chain.invoke({"schema_info": schema_info, "question": question}).strip()
+
+    try:
+        result = pd.read_sql_query(sql_query, con=sql_engine)
+        return result
+    except SQLAlchemyError as e:
+        return f"Error executing query: {e}"
+
+# Step 5: Main function to orchestrate the process
+def main():
+    # Provide a static path or ask the user for a path
+    choice = input("Do you want to provide a static path (1) or enter the path manually (2)? Enter 1 or 2: ")
+    
+    if choice == "1":
+        file_path = "/Users/fnusatvik/Desktop/cookies.csv"  # Replace with your static file path
+    elif choice == "2":
+        file_path = input("Enter the path to your CSV file: ")
+    else:
+        print("Invalid choice. Exiting.")
+        return
+    
+    # Load the CSV file
+    df = load_csv(file_path)
+    
+    # Generate the basic schema
+    basic_schema = generate_basic_schema(df)
+    
+    # Enhance the schema with LLM
+    enhanced_schema = enhance_schema_with_llm(llm, basic_schema)
+    print("Enhanced Schema:\n", json.dumps(enhanced_schema, indent=2))
+    
+    # Set up the in-memory SQL database
+    sql_engine = setup_database(df)
+    
+    # Start the query loop
+    print("Ask your questions about the data. Type 'exit' to finish.")
+    while True:
+        question = input("Your question: ")
+        if question.lower() == "exit":
+            break
+        result = ask_question_and_query(sql_engine, question, enhanced_schema)
+        print("Result:\n", result)
+    
+    # Clean up resources
+    sql_engine.dispose()
+    print("Session ended. Resources have been cleaned up.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
