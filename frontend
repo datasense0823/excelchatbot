@@ -1,0 +1,179 @@
+import pandas as pd
+import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+from langchain_groq import ChatGroq
+
+# Load environment variables
+load_dotenv()
+
+class SessionManager:
+    """Manages the lifecycle of a user session."""
+    def __init__(self, csv_path):
+        self.csv_path = csv_path
+        self.df = None
+        self.schema = None
+        self.enhanced_schema = None  # Store enhanced schema
+        self.engine = None
+        self.llm = ChatGroq(temperature=0, model="llama3-8b-8192")
+
+    def start_session(self):
+        """Initialize session resources."""
+        self._load_csv()
+        self._generate_schema()
+        self._load_to_sql()
+
+    def _load_csv(self):
+        """Load the CSV file into a DataFrame."""
+        if self.df is None:
+            self.df = pd.read_csv(self.csv_path)
+            print("CSV loaded successfully.")
+
+    def _generate_schema(self):
+        """Generate the schema for the DataFrame."""
+        schema = []
+        for column in self.df.columns:
+            col_data = self.df[column]
+            col_info = {
+                "Column Name": column,
+                "Data Type": str(col_data.dtype),
+                "Max Value": col_data.max() if col_data.dtype in ['int64', 'float64'] else None,
+                "Min Value": col_data.min() if col_data.dtype in ['int64', 'float64'] else None,
+                "Distinct Values": col_data.unique().tolist() if col_data.nunique() < 10 else "Too many to display",
+                "Definition": "Definition not provided"  # Placeholder for variable definition
+            }
+            schema.append(col_info)
+        self.schema = schema
+
+    def _load_to_sql(self):
+        """Load the DataFrame into a SQLite database named 'temp.db'."""
+        if self.engine is None:
+            # Create a SQLite database connection using a named database file
+            self.engine = create_engine("sqlite:///temp.db")
+        try:
+            self.df.to_sql("temp", con=self.engine, index=False, if_exists="replace")
+            print("Data loaded into SQLite database 'temp.db' successfully.")
+        except SQLAlchemyError as e:
+            print("Error loading data into SQLite database:", e)
+
+    def execute_query(self, query):
+        """Execute a query on the SQLite database and return the results."""
+        if not self.engine:
+            print("Database engine is not initialized.")
+            return None
+
+        try:
+            with self.engine.connect() as connection:
+                from sqlalchemy.sql import text
+                result = connection.execute(text(query.strip()))
+                return [row for row in result]
+        except SQLAlchemyError as e:
+            print("Error executing query:", e)
+            return None
+
+    def close_session(self):
+        """Clean up session resources."""
+        if self.engine:
+            try:
+                # Drop the table from the database to clean up after the session
+                with self.engine.connect() as connection:
+                    connection.execute("DROP TABLE IF EXISTS temp;")
+                    print("Table 'temp' dropped successfully.")
+            except SQLAlchemyError as e:
+                print("Error dropping table 'temp':", e)
+            finally:
+                self.engine.dispose()
+                self.engine = None
+                print("Session closed.")
+
+# Initialize session
+csv_path = "/Users/fnusatvik/Desktop/cookies3.csv"
+session = SessionManager(csv_path)
+session.start_session()
+
+# Step 3: Enhance schema using LLM with PromptTemplate and LLMChain
+prompt_template = PromptTemplate(
+    template="Here is a schema for a CSV file with basic details about each column:\n\n{schema}\n\n"
+             "Table Name: temp \n"
+             "For each column, please enhance the schema with:\n"
+             "1. A clear description of what the column represents.\n"
+             "2. Typical values and what they mean.\n"
+             "3. Any known relationships or dependencies with other columns.\n"
+             "4. Any potential use cases or relevant business insights for each variable.\n\n"
+             "Return the enhanced schema in a structured format.",
+    input_variables=["schema"]
+)
+
+chain = prompt_template | session.llm
+response = chain.invoke({"schema": session.schema})
+session.enhanced_schema = response.content  # Store enhanced schema
+print("Enhanced Schema Generated.")
+
+# Step 4: Continuous user interaction
+try:
+    while True:
+        user_question = input("Enter your question (or type 'exit' to quit): ")
+        if user_question.lower() == 'exit':
+            print("Ending session. Goodbye!")
+            break
+
+        prompt = PromptTemplate(
+            template="""
+        You are a smart SQL Assistant designed to generate precise SQL queries based on natural language input from the user.
+
+        Important Guidelines:
+        1. Respond with only the SQL query. Do not include any explanations, noise, extra spaces, or additional characters.
+        2. Ensure all text used in filters is converted to lowercase for consistency.
+        3. Analyze the user's question to determine whether it refers to the `temp` table, the `cookie` table, or both, and generate the appropriate SQL query.
+
+        Database Details:
+        1. **Table - temp:** This table is dynamically uploaded by the user.
+        Schema for `temp`:
+        {schema}
+
+        2. **Table - cookie:** This is a pre-stored table in the database.
+        Schema for `cookie`:
+        - `cookie_name`: STRING. The exact name of the cookie (e.g., 'agent-id').
+        - `vendor`: STRING. The vendor name (e.g., '1st party AXP', 'LinkedIn', 'ContentSquare', 'YouTube').
+        - `classification`: STRING. The type of cookie (e.g., 'Essential', 'Performance', 'Marketing').
+        - `initiator`: STRING. The source initiating the cookie (e.g., 'http only cookie').
+        - `duration`: STRING. The duration for which the cookie is active (e.g., '1 Year').
+        - `market`: STRING. The market or region where the cookie is used (e.g., 'Global').
+        - `ownership`: STRING. Indicates whether the cookie is owned by a first or third party (e.g., '1st Party', '3rd Party').
+
+        **Task:**  
+        Given the following question: "{question}", generate a valid SQL query that answers it.  
+        - The query can reference the `temp` table, the `cookie` table, or both.
+        - Ensure proper joins, filters, and conditions if the query involves both tables.
+
+        Important:  
+        - Respond with only the SQL query. Strictly ensure no extra text, explanations, or formatting errors.  
+         
+        """,
+            input_variables=["schema", "question"]
+        )
+
+
+        # Use the stored enhanced schema for subsequent questions
+        chain = prompt | session.llm
+        response = chain.invoke({"schema": session.enhanced_schema, "question": user_question})
+        sql_query = response.content.strip()  # Ensure the query is clean and executable
+
+        print("Generated SQL Query:")
+        print(sql_query)
+
+        # Execute the query and display results
+        query_result = session.execute_query(sql_query)
+        print("Query Output:")
+        if query_result:
+            for row in query_result:
+                print(row)
+        else:
+            print("No results or error in query execution.")
+
+finally:
+    # Close the session after exiting the loop
+    session.close_session()
